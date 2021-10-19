@@ -90,8 +90,8 @@ static int parse_int(const char *str, int *ret)
 	return SR_OK;
 }
 
-/* Set the next event to wait for in rigol_ds_receive */
-static void rigol_ds_set_wait_event(struct dev_context *devc, enum wait_events event)
+/* Set the next event to wait for in keysight_receive */
+static void keysight_set_wait_event(struct dev_context *devc, enum wait_events event)
 {
 	if (event == WAIT_STOP)
 		devc->wait_status = 2;
@@ -104,7 +104,7 @@ static void rigol_ds_set_wait_event(struct dev_context *devc, enum wait_events e
  * Waiting for a event will return a timeout after 2 to 3 seconds in order
  * to not block the application.
  */
-static int rigol_ds_event_wait(const struct sr_dev_inst *sdi, char status1, char status2)
+static int keysight_event_wait(const struct sr_dev_inst *sdi, char status1, char status2)
 {
 	char *buf, c;
 	struct dev_context *devc;
@@ -152,7 +152,7 @@ static int rigol_ds_event_wait(const struct sr_dev_inst *sdi, char status1, char
 			g_free(buf);
 		} while (c != status1 && c != status2);
 
-		rigol_ds_set_wait_event(devc, WAIT_NONE);
+		keysight_set_wait_event(devc, WAIT_NONE);
 	}
 
 	return SR_OK;
@@ -173,7 +173,7 @@ static int rigol_ds_event_wait(const struct sr_dev_inst *sdi, char status1, char
  * returned multiple times, this effect is mitigated somewhat by sleeping
  * for about one sweep time in that case.
  */
-static int rigol_ds_trigger_wait(const struct sr_dev_inst *sdi)
+static int keysight_trigger_wait(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc;
 	long s;
@@ -196,21 +196,21 @@ static int rigol_ds_trigger_wait(const struct sr_dev_inst *sdi)
 			sr_spew("Sleeping for %ld usecs instead of trigger-wait", s);
 			g_usleep(s);
 		}
-		rigol_ds_set_wait_event(devc, WAIT_NONE);
+		keysight_set_wait_event(devc, WAIT_NONE);
 		return SR_OK;
 	} else {
-		return rigol_ds_event_wait(sdi, 'T', 'A');
+		return keysight_event_wait(sdi, 'T', 'A');
 	}
 }
 
 /* Wait for scope to got to "Stop" in single shot mode */
-static int rigol_ds_stop_wait(const struct sr_dev_inst *sdi)
+static int keysight_stop_wait(const struct sr_dev_inst *sdi)
 {
-	return rigol_ds_event_wait(sdi, 'S', 'S');
+	return keysight_event_wait(sdi, 'S', 'S');
 }
 
 /* Check that a single shot acquisition actually succeeded on the DS2000 */
-static int rigol_ds_check_stop(const struct sr_dev_inst *sdi)
+static int keysight_check_stop(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc;
 	struct sr_channel *ch;
@@ -225,15 +225,15 @@ static int rigol_ds_check_stop(const struct sr_dev_inst *sdi)
 		return SR_OK;
 
 	if (ch->type == SR_CHANNEL_LOGIC) {
-		if (rigol_ds_config_set(sdi, ":WAV:SOUR LA") != SR_OK)
+		if (keysight_config_set(sdi, ":WAV:SOUR LA") != SR_OK)
 			return SR_ERR;
 	} else {
-		if (rigol_ds_config_set(sdi, ":WAV:SOUR CHAN%d",
+		if (keysight_config_set(sdi, ":WAV:SOUR CHAN%d",
 				ch->index + 1) != SR_OK)
 			return SR_ERR;
 	}
 	/* Check that the number of samples will be accepted */
-	if (rigol_ds_config_set(sdi, ":WAV:POIN %d",
+	if (keysight_config_set(sdi, ":WAV:POIN %d",
 			ch->type == SR_CHANNEL_LOGIC ?
 				devc->digital_frame_size :
 				devc->analog_frame_size) != SR_OK)
@@ -256,8 +256,8 @@ static int rigol_ds_check_stop(const struct sr_dev_inst *sdi)
 		sr_warn("Single shot acquisition failed, retrying...");
 		/* Sleep a bit, otherwise the single shot will often fail */
 		g_usleep(500 * 1000);
-		rigol_ds_config_set(sdi, ":SING");
-		rigol_ds_set_wait_event(devc, WAIT_STOP);
+		keysight_config_set(sdi, ":SING");
+		keysight_set_wait_event(devc, WAIT_STOP);
 		return SR_ERR;
 	}
 
@@ -265,7 +265,7 @@ static int rigol_ds_check_stop(const struct sr_dev_inst *sdi)
 }
 
 /* Wait for enough data becoming available in scope output buffer */
-static int rigol_ds_block_wait(const struct sr_dev_inst *sdi)
+static int keysight_block_wait(const struct sr_dev_inst *sdi)
 {
 	char *buf, c;
 	struct dev_context *devc;
@@ -304,13 +304,13 @@ static int rigol_ds_block_wait(const struct sr_dev_inst *sdi)
 		} while (c == 'R' && len < (1000 * 1000));
 	}
 
-	rigol_ds_set_wait_event(devc, WAIT_NONE);
+	keysight_set_wait_event(devc, WAIT_NONE);
 
 	return SR_OK;
 }
 
 /* Send a configuration setting. */
-SR_PRIV int rigol_ds_config_set(const struct sr_dev_inst *sdi, const char *format, ...)
+SR_PRIV int keysight_config_set(const struct sr_dev_inst *sdi, const char *format, ...)
 {
 	struct dev_context *devc = sdi->priv;
 	va_list args;
@@ -334,7 +334,7 @@ SR_PRIV int rigol_ds_config_set(const struct sr_dev_inst *sdi, const char *forma
 }
 
 /* Start capturing a new frameset */
-SR_PRIV int rigol_ds_capture_start(const struct sr_dev_inst *sdi)
+SR_PRIV int keysight_capture_start(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc;
 	gchar *trig_mode;
@@ -359,43 +359,43 @@ SR_PRIV int rigol_ds_capture_start(const struct sr_dev_inst *sdi)
 
 	switch (devc->model->series->protocol) {
 	case PROTOCOL_V1:
-		rigol_ds_set_wait_event(devc, WAIT_TRIGGER);
+		keysight_set_wait_event(devc, WAIT_TRIGGER);
 		break;
 	case PROTOCOL_V2:
 		if (devc->data_source == DATA_SOURCE_LIVE) {
-			if (rigol_ds_config_set(sdi, ":WAV:POIN:MODE NORMAL") != SR_OK)
+			if (keysight_config_set(sdi, ":WAV:POIN:MODE NORMAL") != SR_OK)
 				return SR_ERR;
-			rigol_ds_set_wait_event(devc, WAIT_TRIGGER);
+			keysight_set_wait_event(devc, WAIT_TRIGGER);
 		} else {
-			if (rigol_ds_config_set(sdi, ":STOP") != SR_OK)
+			if (keysight_config_set(sdi, ":STOP") != SR_OK)
 				return SR_ERR;
-			if (rigol_ds_config_set(sdi, ":WAV:POIN:MODE RAW") != SR_OK)
+			if (keysight_config_set(sdi, ":WAV:POIN:MODE RAW") != SR_OK)
 				return SR_ERR;
 			if (sr_scpi_get_string(sdi->conn, ":TRIG:MODE?", &trig_mode) != SR_OK)
 				return SR_ERR;
-			ret = rigol_ds_config_set(sdi, ":TRIG:%s:SWE SING", trig_mode);
+			ret = keysight_config_set(sdi, ":TRIG:%s:SWE SING", trig_mode);
 			g_free(trig_mode);
 			if (ret != SR_OK)
 				return SR_ERR;
-			if (rigol_ds_config_set(sdi, ":RUN") != SR_OK)
+			if (keysight_config_set(sdi, ":RUN") != SR_OK)
 				return SR_ERR;
-			rigol_ds_set_wait_event(devc, WAIT_STOP);
+			keysight_set_wait_event(devc, WAIT_STOP);
 		}
 		break;
 	case PROTOCOL_V3:
 	case PROTOCOL_V4:
 	case PROTOCOL_V5:
-		if (first_frame && rigol_ds_config_set(sdi, ":WAV:FORM BYTE") != SR_OK)
+		if (first_frame && keysight_config_set(sdi, ":WAV:FORM BYTE") != SR_OK)
 			return SR_ERR;
 		if (devc->data_source == DATA_SOURCE_LIVE) {
-			if (first_frame && rigol_ds_config_set(sdi, ":WAV:MODE NORM") != SR_OK)
+			if (first_frame && keysight_config_set(sdi, ":WAV:MODE NORM") != SR_OK)
 				return SR_ERR;
 			devc->analog_frame_size = devc->model->series->live_samples;
 			devc->digital_frame_size = devc->model->series->live_samples;
-			rigol_ds_set_wait_event(devc, WAIT_TRIGGER);
+			keysight_set_wait_event(devc, WAIT_TRIGGER);
 		} else {
 			if (devc->model->series->protocol == PROTOCOL_V3) {
-				if (first_frame && rigol_ds_config_set(sdi, ":WAV:MODE RAW") != SR_OK)
+				if (first_frame && keysight_config_set(sdi, ":WAV:MODE RAW") != SR_OK)
 					return SR_ERR;
 			} else if (devc->model->series->protocol >= PROTOCOL_V4) {
 				num_channels = 0;
@@ -439,12 +439,12 @@ SR_PRIV int rigol_ds_capture_start(const struct sr_dev_inst *sdi)
 				}
 			}
 
-			if (devc->data_source == DATA_SOURCE_LIVE && rigol_ds_config_set(sdi, ":SINGL") != SR_OK)
+			if (devc->data_source == DATA_SOURCE_LIVE && keysight_config_set(sdi, ":SINGL") != SR_OK)
 				return SR_ERR;
-			rigol_ds_set_wait_event(devc, WAIT_STOP);
+			keysight_set_wait_event(devc, WAIT_STOP);
 			if (devc->data_source == DATA_SOURCE_SEGMENTED &&
 					devc->model->series->protocol <= PROTOCOL_V4)
-				if (rigol_ds_config_set(sdi, "FUNC:WREP:FCUR %d", devc->num_frames + 1) != SR_OK)
+				if (keysight_config_set(sdi, "FUNC:WREP:FCUR %d", devc->num_frames + 1) != SR_OK)
 					return SR_ERR;
 		}
 		break;
@@ -454,7 +454,7 @@ SR_PRIV int rigol_ds_capture_start(const struct sr_dev_inst *sdi)
 }
 
 /* Start reading data from the current channel */
-SR_PRIV int rigol_ds_channel_start(const struct sr_dev_inst *sdi)
+SR_PRIV int keysight_channel_start(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc;
 	struct sr_channel *ch;
@@ -479,43 +479,43 @@ SR_PRIV int rigol_ds_channel_start(const struct sr_dev_inst *sdi)
 					ch->index + 1) != SR_OK)
 				return SR_ERR;
 		}
-		rigol_ds_set_wait_event(devc, WAIT_NONE);
+		keysight_set_wait_event(devc, WAIT_NONE);
 		break;
 	case PROTOCOL_V3:
 		if (ch->type == SR_CHANNEL_LOGIC) {
-			if (rigol_ds_config_set(sdi, ":WAV:SOUR LA") != SR_OK)
+			if (keysight_config_set(sdi, ":WAV:SOUR LA") != SR_OK)
 				return SR_ERR;
 		} else {
-			if (rigol_ds_config_set(sdi, ":WAV:SOUR CHAN%d",
+			if (keysight_config_set(sdi, ":WAV:SOUR CHAN%d",
 					ch->index + 1) != SR_OK)
 				return SR_ERR;
 		}
 		if (devc->data_source != DATA_SOURCE_LIVE) {
-			if (rigol_ds_config_set(sdi, ":WAV:RES") != SR_OK)
+			if (keysight_config_set(sdi, ":WAV:RES") != SR_OK)
 				return SR_ERR;
-			if (rigol_ds_config_set(sdi, ":WAV:BEG") != SR_OK)
+			if (keysight_config_set(sdi, ":WAV:BEG") != SR_OK)
 				return SR_ERR;
 		}
 		break;
 	case PROTOCOL_V4:
 	case PROTOCOL_V5:
 		if (ch->type == SR_CHANNEL_ANALOG) {
-			if (rigol_ds_config_set(sdi, ":WAV:SOUR CHAN%d",
+			if (keysight_config_set(sdi, ":WAV:SOUR CHAN%d",
 					ch->index + 1) != SR_OK)
 				return SR_ERR;
 		} else {
-			if (rigol_ds_config_set(sdi, ":WAV:SOUR D%d",
+			if (keysight_config_set(sdi, ":WAV:SOUR D%d",
 					ch->index) != SR_OK)
 				return SR_ERR;
 		}
 
-		if (first_frame && rigol_ds_config_set(sdi,
+		if (first_frame && keysight_config_set(sdi,
 					devc->data_source == DATA_SOURCE_LIVE ?
 						":WAV:MODE NORM" :":WAV:MODE RAW") != SR_OK)
 			return SR_ERR;
 
 		if (devc->data_source != DATA_SOURCE_LIVE) {
-			if (rigol_ds_config_set(sdi, ":WAV:RES") != SR_OK)
+			if (keysight_config_set(sdi, ":WAV:RES") != SR_OK)
 				return SR_ERR;
 		}
 		break;
@@ -539,7 +539,7 @@ SR_PRIV int rigol_ds_channel_start(const struct sr_dev_inst *sdi)
 		devc->vert_inc[ch->index] = devc->vdiv[ch->index] / 25.6;
 	}
 
-	rigol_ds_set_wait_event(devc, WAIT_BLOCK);
+	keysight_set_wait_event(devc, WAIT_BLOCK);
 
 	devc->num_channel_bytes = 0;
 	devc->num_header_bytes = 0;
@@ -549,7 +549,7 @@ SR_PRIV int rigol_ds_channel_start(const struct sr_dev_inst *sdi)
 }
 
 /* Read the header of a data block */
-static int rigol_ds_read_header(struct sr_dev_inst *sdi)
+static int keysight_read_header(struct sr_dev_inst *sdi)
 {
 	struct sr_scpi_dev_inst *scpi = sdi->conn;
 	struct dev_context *devc = sdi->priv;
@@ -605,7 +605,7 @@ static int rigol_ds_read_header(struct sr_dev_inst *sdi)
 	return ret;
 }
 
-SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
+SR_PRIV int keysight_receive(int fd, int revents, void *cb_data)
 {
 	struct sr_dev_inst *sdi;
 	struct sr_scpi_dev_inst *scpi;
@@ -640,21 +640,21 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 	case WAIT_NONE:
 		break;
 	case WAIT_TRIGGER:
-		if (rigol_ds_trigger_wait(sdi) != SR_OK)
+		if (keysight_trigger_wait(sdi) != SR_OK)
 			return TRUE;
-		if (rigol_ds_channel_start(sdi) != SR_OK)
+		if (keysight_channel_start(sdi) != SR_OK)
 			return TRUE;
 		return TRUE;
 	case WAIT_BLOCK:
-		if (rigol_ds_block_wait(sdi) != SR_OK)
+		if (keysight_block_wait(sdi) != SR_OK)
 			return TRUE;
 		break;
 	case WAIT_STOP:
-		if (rigol_ds_stop_wait(sdi) != SR_OK)
+		if (keysight_stop_wait(sdi) != SR_OK)
 			return TRUE;
-		if (rigol_ds_check_stop(sdi) != SR_OK)
+		if (keysight_check_stop(sdi) != SR_OK)
 			return TRUE;
-		if (rigol_ds_channel_start(sdi) != SR_OK)
+		if (keysight_channel_start(sdi) != SR_OK)
 			return TRUE;
 		return TRUE;
 	default:
@@ -669,17 +669,17 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 
 	if (devc->num_block_bytes == 0) {
 		if (devc->model->series->protocol >= PROTOCOL_V4) {
-			if (first_frame && rigol_ds_config_set(sdi, ":WAV:START %d",
+			if (first_frame && keysight_config_set(sdi, ":WAV:START %d",
 					devc->num_channel_bytes + 1) != SR_OK)
 				return TRUE;
-			if (first_frame && rigol_ds_config_set(sdi, ":WAV:STOP %d",
+			if (first_frame && keysight_config_set(sdi, ":WAV:STOP %d",
 					MIN(devc->num_channel_bytes + ACQ_BLOCK_SIZE,
 						devc->analog_frame_size)) != SR_OK)
 				return TRUE;
 		}
 
 		if (devc->model->series->protocol >= PROTOCOL_V3) {
-			if (rigol_ds_config_set(sdi, ":WAV:BEG") != SR_OK)
+			if (keysight_config_set(sdi, ":WAV:BEG") != SR_OK)
 				return TRUE;
 			if (sr_scpi_send(sdi->conn, ":WAV:DATA?") != SR_OK)
 				return TRUE;
@@ -690,7 +690,7 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 
 		if (devc->format == FORMAT_IEEE488_2) {
 			sr_dbg("New block header expected");
-			len = rigol_ds_read_header(sdi);
+			len = keysight_read_header(sdi);
 			if (len == 0)
 				/* Still reading the header. */
 				return TRUE;
@@ -785,7 +785,7 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 			devc->num_header_bytes = 0;
 			devc->num_block_bytes = 0;
 			if (devc->data_source != DATA_SOURCE_LIVE)
-				rigol_ds_set_wait_event(devc, WAIT_BLOCK);
+				keysight_set_wait_event(devc, WAIT_BLOCK);
 		}
 		if (!sr_scpi_read_complete(scpi) && !devc->channel_entry->next) {
 			sr_err("Read should have been completed");
@@ -811,13 +811,13 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 			 * to the next channel causes an error. Fun with
 			 * firmware...
 			 */
-			rigol_ds_config_set(sdi, ":WAV:END");
+			keysight_config_set(sdi, ":WAV:END");
 	}
 
 	if (devc->channel_entry->next) {
 		/* We got the frame for this channel, now get the next channel. */
 		devc->channel_entry = devc->channel_entry->next;
-		rigol_ds_channel_start(sdi);
+		keysight_channel_start(sdi);
 	} else {
 		/* Done with this frame. */
 		std_session_send_df_frame_end(sdi);
@@ -830,7 +830,7 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 		if (devc->data_source == DATA_SOURCE_SEGMENTED &&
 				devc->model->series->protocol == PROTOCOL_V5) {
 			int frames = 0;
-			if (rigol_ds_config_set(sdi, "REC:CURR %d", devc->num_frames + 1) != SR_OK)
+			if (keysight_config_set(sdi, "REC:CURR %d", devc->num_frames + 1) != SR_OK)
 				return SR_ERR;
 			if (sr_scpi_get_int(sdi->conn, "REC:CURR?", &frames) != SR_OK)
 				return SR_ERR;
@@ -846,7 +846,7 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 			/* Get the next frame, starting with the first channel. */
 			devc->channel_entry = devc->enabled_channels;
 
-			rigol_ds_capture_start(sdi);
+			keysight_capture_start(sdi);
 
 			/* Start of next frame. */
 			std_session_send_df_frame_begin(sdi);
@@ -856,7 +856,7 @@ SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data)
 	return TRUE;
 }
 
-SR_PRIV int rigol_ds_get_dev_cfg(const struct sr_dev_inst *sdi)
+SR_PRIV int keysight_get_dev_cfg(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc;
 	struct sr_channel *ch;
@@ -938,7 +938,7 @@ SR_PRIV int rigol_ds_get_dev_cfg(const struct sr_dev_inst *sdi)
 		sr_dbg("CH%d %g", i + 1, devc->attenuation[i]);
 
 	/* Vertical gain and offset. */
-	if (rigol_ds_get_dev_cfg_vertical(sdi) != SR_OK)
+	if (keysight_get_dev_cfg_vertical(sdi) != SR_OK)
 		return SR_ERR;
 
 	/* Coupling. */
@@ -983,7 +983,7 @@ SR_PRIV int rigol_ds_get_dev_cfg(const struct sr_dev_inst *sdi)
 	return SR_OK;
 }
 
-SR_PRIV int rigol_ds_get_dev_cfg_vertical(const struct sr_dev_inst *sdi)
+SR_PRIV int keysight_get_dev_cfg_vertical(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc;
 	char *cmd;

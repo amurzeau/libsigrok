@@ -58,13 +58,13 @@ enum data_source {
 	DATA_SOURCE_SEGMENTED,
 };
 
-struct rigol_ds_vendor {
+struct keysight_vendor {
 	const char *name;
 	const char *full_name;
 };
 
-struct rigol_ds_series {
-	const struct rigol_ds_vendor *vendor;
+struct keysight_series {
+	const struct keysight_vendor *vendor;
 	const char *name;
 	enum protocol_version protocol;
 	enum data_format format;
@@ -80,20 +80,20 @@ enum cmds {
 	CMD_SET_HORIZ_TRIGGERPOS,
 };
 
-struct rigol_ds_command {
+struct keysight_command {
 	int cmd;
 	const char *str;
 };
 
-struct rigol_ds_model {
-	const struct rigol_ds_series *series;
+struct keysight_model {
+	const struct keysight_series *series;
 	const char *name;
 	uint64_t min_timebase[2];
 	unsigned int analog_channels;
 	bool has_digital;
 	const char **trigger_sources;
 	unsigned int num_trigger_sources;
-	const struct rigol_ds_command *cmds;
+	const struct keysight_command *cmds;
 };
 
 enum wait_events {
@@ -104,7 +104,7 @@ enum wait_events {
 };
 
 struct dev_context {
-	const struct rigol_ds_model *model;
+	const struct keysight_model *model;
 	enum data_format format;
 
 	/* Device properties */
@@ -165,11 +165,11 @@ struct dev_context {
 	float *data;
 };
 
-SR_PRIV int rigol_ds_config_set(const struct sr_dev_inst *sdi, const char *format, ...);
-SR_PRIV int rigol_ds_capture_start(const struct sr_dev_inst *sdi);
-SR_PRIV int rigol_ds_channel_start(const struct sr_dev_inst *sdi);
-SR_PRIV int rigol_ds_receive(int fd, int revents, void *cb_data);
-SR_PRIV int rigol_ds_get_dev_cfg(const struct sr_dev_inst *sdi);
-SR_PRIV int rigol_ds_get_dev_cfg_vertical(const struct sr_dev_inst *sdi);
+SR_PRIV int keysight_config_set(const struct sr_dev_inst *sdi, const char *format, ...);
+SR_PRIV int keysight_capture_start(const struct sr_dev_inst *sdi);
+SR_PRIV int keysight_channel_start(const struct sr_dev_inst *sdi);
+SR_PRIV int keysight_receive(int fd, int revents, void *cb_data);
+SR_PRIV int keysight_get_dev_cfg(const struct sr_dev_inst *sdi);
+SR_PRIV int keysight_get_dev_cfg_vertical(const struct sr_dev_inst *sdi);
 
 #endif
