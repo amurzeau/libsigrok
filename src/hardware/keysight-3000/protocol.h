@@ -53,9 +53,9 @@ enum data_format {
 };
 
 enum data_source {
-	DATA_SOURCE_LIVE,
-	DATA_SOURCE_MEMORY,
-	DATA_SOURCE_SEGMENTED,
+	DATA_SOURCE_LIVE, /* Use normal data, from "measurement record" */
+	DATA_SOURCE_MEMORY, /* Use raw data, from "acquisition record" */
+	DATA_SOURCE_SEGMENTED, /* Segmented memory on Infiniium oscilloscopes allows the acquisition memory to be divided into a set of equal-length sub-records, which are equal in total collective length to the full memory depth of the oscilloscope. */
 };
 
 struct keysight_vendor {
