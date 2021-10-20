@@ -29,34 +29,13 @@
 #define LOG_PREFIX "rigol-ds"
 
 /* Size of acquisition buffers */
-#define ACQ_BUFFER_SIZE (32 * 1024)
+#define ACQ_BUFFER_SIZE (64 * 1024)
 
 /* Maximum number of samples to retrieve at once. */
-#define ACQ_BLOCK_SIZE (30 * 1000)
+#define ACQ_BLOCK_SIZE (64 * 1000)
 
 #define MAX_ANALOG_CHANNELS 4
 #define MAX_DIGITAL_CHANNELS 16
-
-enum protocol_version {
-	PROTOCOL_V1, /* VS5000 */
-	PROTOCOL_V2, /* DS1000 */
-	PROTOCOL_V3, /* DS2000, DSO1000 */
-	PROTOCOL_V4, /* DS1000Z */
-	PROTOCOL_V5, /* MSO5000 */
-};
-
-enum data_format {
-	/* Used by DS1000 versions up to 2.02, and VS5000 series */
-	FORMAT_RAW,
-	/* Used by DS1000 versions from 2.04 onwards and all later series */
-	FORMAT_IEEE488_2,
-};
-
-enum data_source {
-	DATA_SOURCE_LIVE, /* Use normal data, from "measurement record" */
-	DATA_SOURCE_MEMORY, /* Use raw data, from "acquisition record" */
-	DATA_SOURCE_SEGMENTED, /* Segmented memory on Infiniium oscilloscopes allows the acquisition memory to be divided into a set of equal-length sub-records, which are equal in total collective length to the full memory depth of the oscilloscope. */
-};
 
 struct keysight_vendor {
 	const char *name;
@@ -66,8 +45,6 @@ struct keysight_vendor {
 struct keysight_series {
 	const struct keysight_vendor *vendor;
 	const char *name;
-	enum protocol_version protocol;
-	enum data_format format;
 	uint64_t max_timebase[2];
 	uint64_t min_vdiv[2];
 	int num_horizontal_divs;
@@ -93,19 +70,16 @@ struct keysight_model {
 	bool has_digital;
 	const char **trigger_sources;
 	unsigned int num_trigger_sources;
-	const struct keysight_command *cmds;
 };
 
-enum wait_events {
-	WAIT_NONE,    /* Don't wait */
-	WAIT_TRIGGER, /* Wait for trigger (only live capture) */
-	WAIT_BLOCK,   /* Wait for block data (only when reading sample mem) */
-	WAIT_STOP,    /* Wait for scope stopping (only single shots) */
+enum state_e {
+	STATE_IDLE = 10000,
+	STATE_DIGITIZING,
+	STATE_READING_DATA
 };
 
 struct dev_context {
 	const struct keysight_model *model;
-	enum data_format format;
 
 	/* Device properties */
 	const uint64_t (*timebases)[2];
@@ -119,15 +93,11 @@ struct dev_context {
 
 	/* Acquisition settings */
 	GSList *enabled_channels;
-	uint64_t limit_frames;
-	enum data_source data_source;
-	uint64_t analog_frame_size;
-	uint64_t digital_frame_size;
+	int limit_frames;
 
 	/* Device settings */
 	gboolean analog_channels[MAX_ANALOG_CHANNELS];
 	gboolean digital_channels[MAX_DIGITAL_CHANNELS];
-	gboolean la_enabled;
 	float timebase;
 	float sample_rate;
 	float attenuation[MAX_ANALOG_CHANNELS];
@@ -144,10 +114,10 @@ struct dev_context {
 
 	/* Number of frames received in total. */
 	uint64_t num_frames;
-	/* Number of frames available from the Segmented data source */
-	uint64_t num_frames_segmented;
 	/* GSList entry for the current channel. */
 	GSList *channel_entry;
+	/* Number of bytes total for current channel. */
+	int num_channel_bytes_total;
 	/* Number of bytes received for current channel. */
 	uint64_t num_channel_bytes;
 	/* Number of bytes of block header read */
@@ -157,9 +127,7 @@ struct dev_context {
 	/* Number of data block bytes already read */
 	uint64_t num_block_read;
 	/* What to wait for in *_receive */
-	enum wait_events wait_event;
-	/* Trigger/block copying/stop waiting status */
-	int wait_status;
+	enum state_e state;
 	/* Acq buffers used for reading from the scope and sending data to app */
 	unsigned char *buffer;
 	float *data;

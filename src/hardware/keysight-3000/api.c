@@ -50,7 +50,6 @@ static const uint32_t devopts[] = {
 	SR_CONF_TRIGGER_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_TRIGGER_SLOPE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_TRIGGER_LEVEL | SR_CONF_GET | SR_CONF_SET,
-	SR_CONF_DATA_SOURCE | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 };
 
 static const uint32_t devopts_cg_analog[] = {
@@ -126,6 +125,10 @@ static const uint64_t vdivs[][2] = {
 	{ 100, 1 },
 };
 
+/*
+ * Replace CH1 with CHAN1
+ */
+
 static const char *trigger_sources_2_chans[] = {
 	"CH1", "CH2",
 	"EXT", "AC Line",
@@ -145,23 +148,11 @@ static const char *trigger_slopes[] = {
 };
 
 static const char *coupling[] = {
-	"AC", "DC", "GND",
+	"AC", "DC",
 };
 
 static const uint64_t probe_factor[] = {
-	1, 2, 5, 10, 20, 50, 100, 200, 500, 1000,
-};
-
-/* Do not change the order of entries */
-static const char *data_sources[] = {
-	"Live",
-	"Memory",
-	"Segmented",
-};
-
-static const struct keysight_command std_cmd[] = {
-	{ CMD_GET_HORIZ_TRIGGERPOS, ":TIM:POS?" },
-	{ CMD_SET_HORIZ_TRIGGERPOS, ":TIM:POS %s" },
+	1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 10000,
 };
 
 enum vendor {
@@ -178,10 +169,10 @@ static const struct keysight_vendor supported_vendors[] = {
 };
 
 #define VENDOR(x) &supported_vendors[x]
-/* vendor, series/name, protocol, data format, max timebase, min vdiv,
+/* vendor, series/name, max timebase, min vdiv,
  * number of horizontal divs, live waveform samples, memory buffer samples */
 static const struct keysight_series supported_series[] = {
-	[DSO3000] = {VENDOR(KEYSIGHT), "DSO3000", PROTOCOL_V1, FORMAT_IEEE488_2,
+	[DSO3000] = {VENDOR(KEYSIGHT), "DSO3000",
 		{50, 1}, {2, 1000}, 10, 62500, 4000000},
 };
 
@@ -193,9 +184,9 @@ static const struct keysight_series supported_series[] = {
 #define CH_INFO(num, digital) \
 	num, digital, trigger_sources_##num##_chans, \
 	digital ? ARRAY_SIZE(trigger_sources_##num##_chans) : (num + 2)
-/* series, model, min timebase, analog channels, digital */
+/* series, model, min timebase, analog channels */
 static const struct keysight_model supported_models[] = {
-	{SERIES(DSO3000), "MSO3054T", {2, 1000000000}, CH_INFO(4, true), std_cmd},
+	{SERIES(DSO3000), "MSO3054T", {2, 1000000000}, CH_INFO(4, true)},
 };
 
 static struct sr_dev_driver keysight_driver_info;
@@ -270,31 +261,6 @@ static struct sr_dev_inst *probe_device(struct sr_scpi_dev_inst *scpi)
 	devc = g_malloc0(sizeof(struct dev_context));
 	devc->limit_frames = 0;
 	devc->model = model;
-	devc->format = model->series->format;
-
-	/* DS1000 models with firmware before 0.2.4 used the old data format. */
-	if (model->series == SERIES(DS1000)) {
-		version = g_strsplit(hw_info->firmware_version, ".", 0);
-		do {
-			if (!version[0] || !version[1] || !version[2])
-				break;
-			if (version[0][0] == 0 || version[1][0] == 0 || version[2][0] == 0)
-				break;
-			for (i = 0; i < 3; i++) {
-				if (sr_atol(version[i], &n[i]) != SR_OK)
-					break;
-			}
-			if (i != 3)
-				break;
-			scpi->firmware_version = n[0] * 100 + n[1] * 10 + n[2];
-			if (scpi->firmware_version < 24) {
-				sr_dbg("Found DS1000 firmware < 0.2.4, using raw data format.");
-				devc->format = FORMAT_RAW;
-			}
-			break;
-		} while (0);
-		g_strfreev(version);
-	}
 
 	sr_scpi_hw_info_free(hw_info);
 
@@ -346,7 +312,6 @@ static struct sr_dev_inst *probe_device(struct sr_scpi_dev_inst *scpi)
 	devc->buffer = g_malloc(ACQ_BUFFER_SIZE);
 	devc->data = g_malloc(ACQ_BUFFER_SIZE * sizeof(float));
 
-	devc->data_source = DATA_SOURCE_LIVE;
 
 	sdi->priv = devc;
 
@@ -365,6 +330,11 @@ static int dev_open(struct sr_dev_inst *sdi)
 
 	if ((ret = sr_scpi_open(scpi)) < 0) {
 		sr_err("Failed to open SCPI device: %s.", sr_strerror(ret));
+		return SR_ERR;
+	}
+
+	if ((ret = keysight_config_set(sdi, ":TRIG:MODE EDGE")) != SR_OK) {
+		sr_err("Failed to set trigger mode to edge: %s.", sr_strerror(ret));
 		return SR_ERR;
 	}
 
@@ -387,9 +357,6 @@ static int dev_close(struct sr_dev_inst *sdi)
 	if (!scpi)
 		return SR_ERR_BUG;
 
-	if (devc->model->series->protocol == PROTOCOL_V2)
-		keysight_config_set(sdi, ":KEY:LOCK DISABLE");
-
 	return sr_scpi_close(scpi);
 }
 
@@ -409,30 +376,14 @@ static int analog_frame_size(const struct sr_dev_inst *sdi)
 	if (analog_channels == 0)
 		return 0;
 
-	switch (devc->data_source) {
-	case DATA_SOURCE_LIVE:
-		return devc->model->series->live_samples;
-	case DATA_SOURCE_MEMORY:
-	case DATA_SOURCE_SEGMENTED:
-		return devc->model->series->buffer_samples / analog_channels;
-	default:
-		return 0;
-	}
+	return devc->model->series->live_samples;
 }
 
 static int digital_frame_size(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc = sdi->priv;
 
-	switch (devc->data_source) {
-	case DATA_SOURCE_LIVE:
-		return devc->model->series->live_samples * 2;
-	case DATA_SOURCE_MEMORY:
-	case DATA_SOURCE_SEGMENTED:
-		return devc->model->series->buffer_samples * 2;
-	default:
-		return 0;
-	}
+	return devc->model->series->live_samples * 2;
 }
 
 static int config_get(uint32_t key, GVariant **data,
@@ -475,14 +426,6 @@ static int config_get(uint32_t key, GVariant **data,
 	case SR_CONF_NUM_VDIV:
 		*data = g_variant_new_int32(devc->num_vdivs);
 		break;
-	case SR_CONF_DATA_SOURCE:
-		if (devc->data_source == DATA_SOURCE_LIVE)
-			*data = g_variant_new_string("Live");
-		else if (devc->data_source == DATA_SOURCE_MEMORY)
-			*data = g_variant_new_string("Memory");
-		else
-			*data = g_variant_new_string("Segmented");
-		break;
 	case SR_CONF_LIMIT_FRAMES:
 		*data = g_variant_new_uint64(devc->limit_frames);
 		break;
@@ -490,7 +433,7 @@ static int config_get(uint32_t key, GVariant **data,
 		*data = g_variant_new_uint64(devc->sample_rate);
 		break;
 	case SR_CONF_TRIGGER_SOURCE:
-		if (!strcmp(devc->trigger_source, "ACL"))
+		if (!strcmp(devc->trigger_source, "LINE"))
 			tmp_str = "AC Line";
 		else if (!strcmp(devc->trigger_source, "CHAN1"))
 			tmp_str = "CH1";
@@ -613,8 +556,7 @@ static int config_set(uint32_t key, GVariant *data,
 		 * need to express this in seconds. */
 		t_dbl = -(devc->horiz_triggerpos - 0.5) * devc->timebase * devc->num_timebases;
 		g_ascii_formatd(buffer, sizeof(buffer), "%.6f", t_dbl);
-		return keysight_config_set(sdi,
-			devc->model->cmds[CMD_SET_HORIZ_TRIGGERPOS].str, buffer);
+		return keysight_config_set(sdi, ":TIM:POS %s", buffer);
 	case SR_CONF_TRIGGER_LEVEL:
 		t_dbl = g_variant_get_double(data);
 		g_ascii_formatd(buffer, sizeof(buffer), "%.3f", t_dbl);
@@ -635,7 +577,7 @@ static int config_set(uint32_t key, GVariant *data,
 		g_free(devc->trigger_source);
 		devc->trigger_source = g_strdup(devc->model->trigger_sources[idx]);
 		if (!strcmp(devc->trigger_source, "AC Line"))
-			tmp_str = "ACL";
+			tmp_str = "LINE";
 		else if (!strcmp(devc->trigger_source, "CH1"))
 			tmp_str = "CHAN1";
 		else if (!strcmp(devc->trigger_source, "CH2"))
@@ -680,21 +622,6 @@ static int config_set(uint32_t key, GVariant *data,
 		if (ret == SR_OK)
 			keysight_get_dev_cfg_vertical(sdi);
 		return ret;
-	case SR_CONF_DATA_SOURCE:
-		tmp_str = g_variant_get_string(data, NULL);
-		if (!strcmp(tmp_str, "Live"))
-			devc->data_source = DATA_SOURCE_LIVE;
-		else if (devc->model->series->protocol >= PROTOCOL_V2
-			&& !strcmp(tmp_str, "Memory"))
-			devc->data_source = DATA_SOURCE_MEMORY;
-		else if (devc->model->series->protocol >= PROTOCOL_V3
-			 && !strcmp(tmp_str, "Segmented"))
-			devc->data_source = DATA_SOURCE_SEGMENTED;
-		else {
-			sr_err("Unknown data source: '%s'.", tmp_str);
-			return SR_ERR;
-		}
-		break;
 	default:
 		return SR_ERR_NA;
 	}
@@ -761,22 +688,6 @@ static int config_list(uint32_t key, GVariant **data,
 	case SR_CONF_TRIGGER_SLOPE:
 		*data = g_variant_new_strv(ARRAY_AND_SIZE(trigger_slopes));
 		break;
-	case SR_CONF_DATA_SOURCE:
-		if (!devc)
-			/* Can't know this until we have the exact model. */
-			return SR_ERR_ARG;
-		switch (devc->model->series->protocol) {
-		case PROTOCOL_V1:
-			*data = g_variant_new_strv(data_sources, ARRAY_SIZE(data_sources) - 2);
-			break;
-		case PROTOCOL_V2:
-			*data = g_variant_new_strv(data_sources, ARRAY_SIZE(data_sources) - 1);
-			break;
-		default:
-			*data = g_variant_new_strv(ARRAY_AND_SIZE(data_sources));
-			break;
-		}
-		break;
 	default:
 		return SR_ERR_NA;
 	}
@@ -791,15 +702,11 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	struct sr_channel *ch;
 	gboolean some_digital;
 	GSList *l;
-	char *cmd;
-	int protocol;
 
 	scpi = sdi->conn;
 	devc = sdi->priv;
-	protocol = devc->model->series->protocol;
 
 	devc->num_frames = 0;
-	devc->num_frames_segmented = 0;
 
 	some_digital = FALSE;
 	for (l = sdi->channels; l; l = l->next) {
@@ -819,31 +726,12 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		} else if (ch->type == SR_CHANNEL_LOGIC) {
 			/* Only one list entry for older protocols. All channels are
 			 * retrieved together when this entry is processed. */
-			if (ch->enabled && (
-						protocol > PROTOCOL_V3 ||
-						!some_digital))
+			if (ch->enabled)
 				devc->enabled_channels = g_slist_append(
 						devc->enabled_channels, ch);
-			if (ch->enabled) {
-				some_digital = TRUE;
-				/* Turn on LA module if currently off. */
-				if (!devc->la_enabled) {
-					if (keysight_config_set(sdi, protocol >= PROTOCOL_V3 ?
-								":LA:STAT ON" : ":LA:DISP ON") != SR_OK)
-						return SR_ERR;
-					devc->la_enabled = TRUE;
-				}
-			}
 			if (ch->enabled != devc->digital_channels[ch->index]) {
 				/* Enabled channel is currently disabled, or vice versa. */
-				if (protocol >= PROTOCOL_V5)
-					cmd = ":LA:DISP D%d,%s";
-				else if (protocol >= PROTOCOL_V3)
-					cmd = ":LA:DIG%d:DISP %s";
-				else
-					cmd = ":DIG%d:TURN %s";
-
-				if (keysight_config_set(sdi, cmd, ch->index,
+				if (keysight_config_set(sdi, ":DIG%d:DISP %s", ch->index,
 						ch->enabled ? "ON" : "OFF") != SR_OK)
 					return SR_ERR;
 				devc->digital_channels[ch->index] = ch->enabled;
@@ -854,96 +742,12 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 	if (!devc->enabled_channels)
 		return SR_ERR;
 
-	/* Turn off LA module if on and no digital channels selected. */
-	if (devc->la_enabled && !some_digital)
-		if (keysight_config_set(sdi,
-				devc->model->series->protocol >= PROTOCOL_V3 ?
-					":LA:STAT OFF" : ":LA:DISP OFF") != SR_OK)
-			return SR_ERR;
-
-	/* Set memory mode. */
-	if (devc->data_source == DATA_SOURCE_SEGMENTED) {
-		switch (protocol) {
-		case PROTOCOL_V1:
-		case PROTOCOL_V2:
-			/* V1 and V2 do not have segmented data */
-			sr_err("Data source 'Segmented' not supported on this model");
-			break;
-		case PROTOCOL_V3:
-		case PROTOCOL_V4:
-		{
-			int frames = 0;
-			if (sr_scpi_get_int(sdi->conn,
-						protocol == PROTOCOL_V4 ? "FUNC:WREP:FEND?" :
-						"FUNC:WREP:FMAX?", &frames) != SR_OK)
-				return SR_ERR;
-			if (frames <= 0) {
-				sr_err("No segmented data available");
-				return SR_ERR;
-			}
-			devc->num_frames_segmented = frames;
-			break;
-		}
-		case PROTOCOL_V5:
-			/* The frame limit has to be read on the fly, just set up
-			 * reading of the first frame */
-			if (keysight_config_set(sdi, "REC:CURR 1") != SR_OK)
-				return SR_ERR;
-			break;
-		default:
-			sr_err("Data source 'Segmented' not yet supported");
-			return SR_ERR;
-		}
-	}
-
-	devc->analog_frame_size = analog_frame_size(sdi);
-	devc->digital_frame_size = digital_frame_size(sdi);
-
-	switch (devc->model->series->protocol) {
-	case PROTOCOL_V2:
-		if (keysight_config_set(sdi, ":ACQ:MEMD LONG") != SR_OK)
-			return SR_ERR;
-		break;
-	case PROTOCOL_V3:
-		/* Apparently for the DS2000 the memory
-		 * depth can only be set in Running state -
-		 * this matches the behaviour of the UI. */
-		if (keysight_config_set(sdi, ":RUN") != SR_OK)
-			return SR_ERR;
-		if (keysight_config_set(sdi, ":ACQ:MDEP %d",
-					devc->analog_frame_size) != SR_OK)
-			return SR_ERR;
-		if (keysight_config_set(sdi, ":STOP") != SR_OK)
-			return SR_ERR;
-		break;
-	default:
-		break;
-	}
-
-	if (devc->data_source == DATA_SOURCE_LIVE)
-		if (keysight_config_set(sdi, ":RUN") != SR_OK)
-			return SR_ERR;
-
 	sr_scpi_source_add(sdi->session, scpi, G_IO_IN, 50,
 			keysight_receive, (void *)sdi);
 
 	std_session_send_df_header(sdi);
 
 	devc->channel_entry = devc->enabled_channels;
-
-	if (devc->data_source == DATA_SOURCE_LIVE)
-		devc->sample_rate = analog_frame_size(sdi) / 
-			(devc->timebase * devc->model->series->num_horizontal_divs);
-	else {
-		float xinc;
-		if (devc->model->series->protocol >= PROTOCOL_V3 && 
-				sr_scpi_get_float(sdi->conn, "WAV:XINC?", &xinc) != SR_OK) {
-			sr_err("Couldn't get sampling rate");
-			return SR_ERR;
-		}
-		devc->sample_rate = 1. / xinc;
-	}
-
 
 	if (keysight_capture_start(sdi) != SR_OK)
 		return SR_ERR;
@@ -972,8 +776,8 @@ static int dev_acquisition_stop(struct sr_dev_inst *sdi)
 }
 
 static struct sr_dev_driver keysight_driver_info = {
-	.name = "rigol-ds",
-	.longname = "Rigol DS",
+	.name = "keysight",
+	.longname = "Keysight Oscilloscopes",
 	.api_version = 1,
 	.init = std_init,
 	.cleanup = std_cleanup,

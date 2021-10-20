@@ -508,6 +508,12 @@ src_libdrivers_la_SOURCES += \
 	src/hardware/kern-scale/protocol.c \
 	src/hardware/kern-scale/api.c
 endif
+if HW_KEYSIGHT_3000
+src_libdrivers_la_SOURCES += \
+	src/hardware/keysight-3000/protocol.h \
+	src/hardware/keysight-3000/protocol.c \
+	src/hardware/keysight-3000/api.c
+endif
 if HW_KINGST_LA2016
 src_libdrivers_la_SOURCES += \
 	src/hardware/kingst-la2016/protocol.h \

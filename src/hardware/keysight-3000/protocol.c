@@ -90,225 +90,6 @@ static int parse_int(const char *str, int *ret)
 	return SR_OK;
 }
 
-/* Set the next event to wait for in keysight_receive */
-static void keysight_set_wait_event(struct dev_context *devc, enum wait_events event)
-{
-	if (event == WAIT_STOP)
-		devc->wait_status = 2;
-	else
-		devc->wait_status = 1;
-	devc->wait_event = event;
-}
-
-/*
- * Waiting for a event will return a timeout after 2 to 3 seconds in order
- * to not block the application.
- */
-static int keysight_event_wait(const struct sr_dev_inst *sdi, char status1, char status2)
-{
-	char *buf, c;
-	struct dev_context *devc;
-	time_t start;
-
-	if (!(devc = sdi->priv))
-		return SR_ERR;
-
-	start = time(NULL);
-
-	/*
-	 * Trigger status may return:
-	 * "TD" or "T'D" - triggered
-	 * "AUTO"        - autotriggered
-	 * "RUN"         - running
-	 * "WAIT"        - waiting for trigger
-	 * "STOP"        - stopped
-	 */
-
-	if (devc->wait_status == 1) {
-		do {
-			if (time(NULL) - start >= 3) {
-				sr_dbg("Timeout waiting for trigger");
-				return SR_ERR_TIMEOUT;
-			}
-
-			if (sr_scpi_get_string(sdi->conn, ":TRIG:STAT?", &buf) != SR_OK)
-				return SR_ERR;
-			c = buf[0];
-			g_free(buf);
-		} while (c == status1 || c == status2);
-
-		devc->wait_status = 2;
-	}
-	if (devc->wait_status == 2) {
-		do {
-			if (time(NULL) - start >= 3) {
-				sr_dbg("Timeout waiting for trigger");
-				return SR_ERR_TIMEOUT;
-			}
-
-			if (sr_scpi_get_string(sdi->conn, ":TRIG:STAT?", &buf) != SR_OK)
-				return SR_ERR;
-			c = buf[0];
-			g_free(buf);
-		} while (c != status1 && c != status2);
-
-		keysight_set_wait_event(devc, WAIT_NONE);
-	}
-
-	return SR_OK;
-}
-
-/*
- * For live capture we need to wait for a new trigger event to ensure that
- * sample data is not returned twice.
- *
- * Unfortunately this will never really work because for sufficiently fast
- * timebases and trigger rates it just can't catch the status changes.
- *
- * What would be needed is a trigger event register with autoreset like the
- * Agilents have. The Rigols don't seem to have anything like this.
- *
- * The workaround is to only wait for the trigger when the timebase is slow
- * enough. Of course this means that for faster timebases sample data can be
- * returned multiple times, this effect is mitigated somewhat by sleeping
- * for about one sweep time in that case.
- */
-static int keysight_trigger_wait(const struct sr_dev_inst *sdi)
-{
-	struct dev_context *devc;
-	long s;
-
-	if (!(devc = sdi->priv))
-		return SR_ERR;
-
-	/*
-	 * If timebase < 50 msecs/DIV just sleep about one sweep time except
-	 * for really fast sweeps.
-	 */
-	if (devc->timebase < 0.0499) {
-		if (devc->timebase > 0.99e-6) {
-			/*
-			 * Timebase * num hor. divs * 85(%) * 1e6(usecs) / 100
-			 * -> 85 percent of sweep time
-			 */
-			s = (devc->timebase * devc->model->series->num_horizontal_divs
-			     * 85e6) / 100L;
-			sr_spew("Sleeping for %ld usecs instead of trigger-wait", s);
-			g_usleep(s);
-		}
-		keysight_set_wait_event(devc, WAIT_NONE);
-		return SR_OK;
-	} else {
-		return keysight_event_wait(sdi, 'T', 'A');
-	}
-}
-
-/* Wait for scope to got to "Stop" in single shot mode */
-static int keysight_stop_wait(const struct sr_dev_inst *sdi)
-{
-	return keysight_event_wait(sdi, 'S', 'S');
-}
-
-/* Check that a single shot acquisition actually succeeded on the DS2000 */
-static int keysight_check_stop(const struct sr_dev_inst *sdi)
-{
-	struct dev_context *devc;
-	struct sr_channel *ch;
-	int tmp;
-
-	if (!(devc = sdi->priv))
-		return SR_ERR;
-
-	ch = devc->channel_entry->data;
-
-	if (devc->model->series->protocol != PROTOCOL_V3)
-		return SR_OK;
-
-	if (ch->type == SR_CHANNEL_LOGIC) {
-		if (keysight_config_set(sdi, ":WAV:SOUR LA") != SR_OK)
-			return SR_ERR;
-	} else {
-		if (keysight_config_set(sdi, ":WAV:SOUR CHAN%d",
-				ch->index + 1) != SR_OK)
-			return SR_ERR;
-	}
-	/* Check that the number of samples will be accepted */
-	if (keysight_config_set(sdi, ":WAV:POIN %d",
-			ch->type == SR_CHANNEL_LOGIC ?
-				devc->digital_frame_size :
-				devc->analog_frame_size) != SR_OK)
-		return SR_ERR;
-	if (sr_scpi_get_int(sdi->conn, "*ESR?", &tmp) != SR_OK)
-		return SR_ERR;
-	/*
-	 * If we get an "Execution error" the scope went from "Single" to
-	 * "Stop" without actually triggering. There is no waveform
-	 * displayed and trying to download one will fail - the scope thinks
-	 * it has 1400 samples (like display memory) and the driver thinks
-	 * it has a different number of samples.
-	 *
-	 * In that case just try to capture something again. Might still
-	 * fail in interesting ways.
-	 *
-	 * Ain't firmware fun?
-	 */
-	if (tmp & 0x10) {
-		sr_warn("Single shot acquisition failed, retrying...");
-		/* Sleep a bit, otherwise the single shot will often fail */
-		g_usleep(500 * 1000);
-		keysight_config_set(sdi, ":SING");
-		keysight_set_wait_event(devc, WAIT_STOP);
-		return SR_ERR;
-	}
-
-	return SR_OK;
-}
-
-/* Wait for enough data becoming available in scope output buffer */
-static int keysight_block_wait(const struct sr_dev_inst *sdi)
-{
-	char *buf, c;
-	struct dev_context *devc;
-	time_t start;
-	int len, ret;
-
-	if (!(devc = sdi->priv))
-		return SR_ERR;
-
-	if (devc->model->series->protocol == PROTOCOL_V3) {
-
-		start = time(NULL);
-
-		do {
-			if (time(NULL) - start >= 3) {
-				sr_dbg("Timeout waiting for data block");
-				return SR_ERR_TIMEOUT;
-			}
-
-			/*
-			 * The scope copies data really slowly from sample
-			 * memory to its output buffer, so try not to bother
-			 * it too much with SCPI requests but don't wait too
-			 * long for short sample frame sizes.
-			 */
-			g_usleep(devc->analog_frame_size < (15 * 1000) ? (100 * 1000) : (1000 * 1000));
-
-			/* "READ,nnnn" (still working) or "IDLE,nnnn" (finished) */
-			if (sr_scpi_get_string(sdi->conn, ":WAV:STAT?", &buf) != SR_OK)
-				return SR_ERR;
-			ret = parse_int(buf + 5, &len);
-			c = buf[0];
-			g_free(buf);
-			if (ret != SR_OK)
-				return SR_ERR;
-		} while (c == 'R' && len < (1000 * 1000));
-	}
-
-	keysight_set_wait_event(devc, WAIT_NONE);
-
-	return SR_OK;
-}
-
 /* Send a configuration setting. */
 SR_PRIV int keysight_config_set(const struct sr_dev_inst *sdi, const char *format, ...)
 {
@@ -323,24 +104,13 @@ SR_PRIV int keysight_config_set(const struct sr_dev_inst *sdi, const char *forma
 	if (ret != SR_OK)
 		return SR_ERR;
 
-	if (devc->model->series->protocol == PROTOCOL_V2) {
-		/* The DS1000 series needs this stupid delay, *OPC? doesn't work. */
-		sr_spew("delay %dms", 100);
-		g_usleep(100 * 1000);
-		return SR_OK;
-	} else {
-		return sr_scpi_get_opc(sdi->conn);
-	}
+	return sr_scpi_get_opc(sdi->conn);
 }
 
 /* Start capturing a new frameset */
 SR_PRIV int keysight_capture_start(const struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc;
-	gchar *trig_mode;
-	unsigned int num_channels, i, j;
-	int buffer_samples;
-	int ret;
 
 	if (!(devc = sdi->priv))
 		return SR_ERR;
@@ -348,8 +118,6 @@ SR_PRIV int keysight_capture_start(const struct sr_dev_inst *sdi)
 	const gboolean first_frame = (devc->num_frames == 0);
 
 	uint64_t limit_frames = devc->limit_frames;
-	if (devc->num_frames_segmented != 0 && devc->num_frames_segmented < limit_frames)
-		limit_frames = devc->num_frames_segmented;
 	if (limit_frames == 0)
 		sr_dbg("Starting data capture for frameset %" PRIu64,
 		       devc->num_frames + 1);
@@ -357,98 +125,10 @@ SR_PRIV int keysight_capture_start(const struct sr_dev_inst *sdi)
 		sr_dbg("Starting data capture for frameset %" PRIu64 " of %"
 		       PRIu64, devc->num_frames + 1, limit_frames);
 
-	switch (devc->model->series->protocol) {
-	case PROTOCOL_V1:
-		keysight_set_wait_event(devc, WAIT_TRIGGER);
-		break;
-	case PROTOCOL_V2:
-		if (devc->data_source == DATA_SOURCE_LIVE) {
-			if (keysight_config_set(sdi, ":WAV:POIN:MODE NORMAL") != SR_OK)
-				return SR_ERR;
-			keysight_set_wait_event(devc, WAIT_TRIGGER);
-		} else {
-			if (keysight_config_set(sdi, ":STOP") != SR_OK)
-				return SR_ERR;
-			if (keysight_config_set(sdi, ":WAV:POIN:MODE RAW") != SR_OK)
-				return SR_ERR;
-			if (sr_scpi_get_string(sdi->conn, ":TRIG:MODE?", &trig_mode) != SR_OK)
-				return SR_ERR;
-			ret = keysight_config_set(sdi, ":TRIG:%s:SWE SING", trig_mode);
-			g_free(trig_mode);
-			if (ret != SR_OK)
-				return SR_ERR;
-			if (keysight_config_set(sdi, ":RUN") != SR_OK)
-				return SR_ERR;
-			keysight_set_wait_event(devc, WAIT_STOP);
-		}
-		break;
-	case PROTOCOL_V3:
-	case PROTOCOL_V4:
-	case PROTOCOL_V5:
-		if (first_frame && keysight_config_set(sdi, ":WAV:FORM BYTE") != SR_OK)
-			return SR_ERR;
-		if (devc->data_source == DATA_SOURCE_LIVE) {
-			if (first_frame && keysight_config_set(sdi, ":WAV:MODE NORM") != SR_OK)
-				return SR_ERR;
-			devc->analog_frame_size = devc->model->series->live_samples;
-			devc->digital_frame_size = devc->model->series->live_samples;
-			keysight_set_wait_event(devc, WAIT_TRIGGER);
-		} else {
-			if (devc->model->series->protocol == PROTOCOL_V3) {
-				if (first_frame && keysight_config_set(sdi, ":WAV:MODE RAW") != SR_OK)
-					return SR_ERR;
-			} else if (devc->model->series->protocol >= PROTOCOL_V4) {
-				num_channels = 0;
+	if (sr_scpi_send(sdi->conn, ":DIGitize;*OPC?") != SR_OK)
+		return TRUE;
 
-				/* Channels 3 and 4 are multiplexed with D0-7 and D8-15 */
-				for (i = 0; i < devc->model->analog_channels; i++) {
-					if (devc->analog_channels[i]) {
-						num_channels++;
-					} else if (i >= 2 && devc->model->has_digital) {
-						for (j = 0; j < 8; j++) {
-							if (devc->digital_channels[8 * (i - 2) + j]) {
-								num_channels++;
-								break;
-							}
-						}
-					}
-				}
-
-				buffer_samples = devc->model->series->buffer_samples;
-				if (first_frame && buffer_samples == 0)
-				{
-					/* The DS4000 series does not have a fixed memory depth, it
-					 * can be chosen from the menu and also varies with number
-					 * of active channels. Retrieve the actual number with the
-					 * ACQ:MDEP command. */
-					sr_scpi_get_int(sdi->conn, "ACQ:MDEP?", &buffer_samples);
-					devc->analog_frame_size = devc->digital_frame_size =
-							buffer_samples;
-				}
-				else if (first_frame)
-				{
-					/* The DS1000Z series has a fixed memory depth which we
-					 * need to divide correctly according to the number of
-					 * active channels. */
-					devc->analog_frame_size = devc->digital_frame_size =
-						num_channels == 1 ?
-							buffer_samples :
-								num_channels == 2 ?
-									buffer_samples / 2 :
-									buffer_samples / 4;
-				}
-			}
-
-			if (devc->data_source == DATA_SOURCE_LIVE && keysight_config_set(sdi, ":SINGL") != SR_OK)
-				return SR_ERR;
-			keysight_set_wait_event(devc, WAIT_STOP);
-			if (devc->data_source == DATA_SOURCE_SEGMENTED &&
-					devc->model->series->protocol <= PROTOCOL_V4)
-				if (keysight_config_set(sdi, "FUNC:WREP:FCUR %d", devc->num_frames + 1) != SR_OK)
-					return SR_ERR;
-		}
-		break;
-	}
+	devc->state = STATE_DIGITIZING;
 
 	return SR_OK;
 }
@@ -468,82 +148,58 @@ SR_PRIV int keysight_channel_start(const struct sr_dev_inst *sdi)
 
 	const gboolean first_frame = (devc->num_frames == 0);
 
-	switch (devc->model->series->protocol) {
-	case PROTOCOL_V1:
-	case PROTOCOL_V2:
-		if (ch->type == SR_CHANNEL_LOGIC) {
-			if (sr_scpi_send(sdi->conn, ":WAV:DATA? DIG") != SR_OK)
-				return SR_ERR;
-		} else {
-			if (sr_scpi_send(sdi->conn, ":WAV:DATA? CHAN%d",
-					ch->index + 1) != SR_OK)
-				return SR_ERR;
-		}
-		keysight_set_wait_event(devc, WAIT_NONE);
-		break;
-	case PROTOCOL_V3:
-		if (ch->type == SR_CHANNEL_LOGIC) {
-			if (keysight_config_set(sdi, ":WAV:SOUR LA") != SR_OK)
-				return SR_ERR;
-		} else {
-			if (keysight_config_set(sdi, ":WAV:SOUR CHAN%d",
-					ch->index + 1) != SR_OK)
-				return SR_ERR;
-		}
-		if (devc->data_source != DATA_SOURCE_LIVE) {
-			if (keysight_config_set(sdi, ":WAV:RES") != SR_OK)
-				return SR_ERR;
-			if (keysight_config_set(sdi, ":WAV:BEG") != SR_OK)
-				return SR_ERR;
-		}
-		break;
-	case PROTOCOL_V4:
-	case PROTOCOL_V5:
+	if (ch->type == SR_CHANNEL_ANALOG) {
+		if (keysight_config_set(sdi, ":WAV:SOUR CHAN%d",
+				ch->index + 1) != SR_OK)
+			return SR_ERR;
+	} else {
+		if (keysight_config_set(sdi, ":WAV:SOUR POD%d",
+				ch->index < 8 ? 1 : 2) != SR_OK)
+			return SR_ERR;
+	}
+
+	if (first_frame) {
+		if (keysight_config_set(sdi, ":WAV:FORM BYTE") != SR_OK)
+			return SR_ERR;
+
+		if (keysight_config_set(sdi, ":WAV:POIN:MODE NORM") != SR_OK)
+			return SR_ERR;
+
+		/* Required for digital data */
+		if (keysight_config_set(sdi, ":WAV:UNS ON") != SR_OK)
+			return SR_ERR;
+
 		if (ch->type == SR_CHANNEL_ANALOG) {
-			if (keysight_config_set(sdi, ":WAV:SOUR CHAN%d",
-					ch->index + 1) != SR_OK)
+			/* Vertical increment. */
+			if (sr_scpi_get_float(sdi->conn, ":WAV:YINC?",
+					&devc->vert_inc[ch->index]) != SR_OK)
 				return SR_ERR;
-		} else {
-			if (keysight_config_set(sdi, ":WAV:SOUR D%d",
-					ch->index) != SR_OK)
+
+			/* Vertical origin. */
+			if (sr_scpi_get_float(sdi->conn, ":WAV:YOR?",
+				&devc->vert_origin[ch->index]) != SR_OK)
 				return SR_ERR;
-		}
 
-		if (first_frame && keysight_config_set(sdi,
-					devc->data_source == DATA_SOURCE_LIVE ?
-						":WAV:MODE NORM" :":WAV:MODE RAW") != SR_OK)
-			return SR_ERR;
-
-		if (devc->data_source != DATA_SOURCE_LIVE) {
-			if (keysight_config_set(sdi, ":WAV:RES") != SR_OK)
+			/* Vertical reference. */
+			if (sr_scpi_get_int(sdi->conn, ":WAV:YREF?",
+					&devc->vert_reference[ch->index]) != SR_OK)
 				return SR_ERR;
 		}
-		break;
 	}
 
-	if (devc->model->series->protocol >= PROTOCOL_V3 &&
-			ch->type == SR_CHANNEL_ANALOG) {
-		/* Vertical increment. */
-		if (first_frame && sr_scpi_get_float(sdi->conn, ":WAV:YINC?",
-				&devc->vert_inc[ch->index]) != SR_OK)
-			return SR_ERR;
-		/* Vertical origin. */
-		if (first_frame && sr_scpi_get_float(sdi->conn, ":WAV:YOR?",
-			&devc->vert_origin[ch->index]) != SR_OK)
-			return SR_ERR;
-		/* Vertical reference. */
-		if (first_frame && sr_scpi_get_int(sdi->conn, ":WAV:YREF?",
-				&devc->vert_reference[ch->index]) != SR_OK)
-			return SR_ERR;
-	} else if (ch->type == SR_CHANNEL_ANALOG) {
-		devc->vert_inc[ch->index] = devc->vdiv[ch->index] / 25.6;
-	}
-
-	keysight_set_wait_event(devc, WAIT_BLOCK);
+	if (sr_scpi_get_int(sdi->conn, ":WAV:POIN?", &devc->num_channel_bytes_total) != SR_OK)
+		return SR_ERR;
 
 	devc->num_channel_bytes = 0;
 	devc->num_header_bytes = 0;
 	devc->num_block_bytes = 0;
+
+	if (sr_scpi_send(sdi->conn, ":WAV:DATA?") != SR_OK)
+		return TRUE;
+	if (sr_scpi_read_begin(sdi->conn) != SR_OK)
+		return TRUE;
+
+	devc->state = STATE_READING_DATA;
 
 	return SR_OK;
 }
@@ -636,87 +292,38 @@ SR_PRIV int keysight_receive(int fd, int revents, void *cb_data)
 
 	const gboolean first_frame = (devc->num_frames == 0);
 
-	switch (devc->wait_event) {
-	case WAIT_NONE:
-		break;
-	case WAIT_TRIGGER:
-		if (keysight_trigger_wait(sdi) != SR_OK)
-			return TRUE;
+	switch (devc->state) {
+	case STATE_IDLE:
+		return TRUE;
+	case STATE_DIGITIZING:
 		if (keysight_channel_start(sdi) != SR_OK)
 			return TRUE;
 		return TRUE;
-	case WAIT_BLOCK:
-		if (keysight_block_wait(sdi) != SR_OK)
-			return TRUE;
+	case STATE_READING_DATA:
+		// handled bellow
 		break;
-	case WAIT_STOP:
-		if (keysight_stop_wait(sdi) != SR_OK)
-			return TRUE;
-		if (keysight_check_stop(sdi) != SR_OK)
-			return TRUE;
-		if (keysight_channel_start(sdi) != SR_OK)
-			return TRUE;
-		return TRUE;
 	default:
 		sr_err("BUG: Unknown event target encountered");
-		break;
+		return TRUE;
 	}
 
 	ch = devc->channel_entry->data;
 
-	expected_data_bytes = ch->type == SR_CHANNEL_ANALOG ?
-			devc->analog_frame_size : devc->digital_frame_size;
-
 	if (devc->num_block_bytes == 0) {
-		if (devc->model->series->protocol >= PROTOCOL_V4) {
-			if (first_frame && keysight_config_set(sdi, ":WAV:START %d",
-					devc->num_channel_bytes + 1) != SR_OK)
-				return TRUE;
-			if (first_frame && keysight_config_set(sdi, ":WAV:STOP %d",
-					MIN(devc->num_channel_bytes + ACQ_BLOCK_SIZE,
-						devc->analog_frame_size)) != SR_OK)
-				return TRUE;
-		}
-
-		if (devc->model->series->protocol >= PROTOCOL_V3) {
-			if (keysight_config_set(sdi, ":WAV:BEG") != SR_OK)
-				return TRUE;
-			if (sr_scpi_send(sdi->conn, ":WAV:DATA?") != SR_OK)
-				return TRUE;
-		}
-
-		if (sr_scpi_read_begin(scpi) != SR_OK)
+		sr_dbg("New block header expected");
+		len = keysight_read_header(sdi);
+		if (len == 0)
+			/* Still reading the header. */
 			return TRUE;
-
-		if (devc->format == FORMAT_IEEE488_2) {
-			sr_dbg("New block header expected");
-			len = keysight_read_header(sdi);
-			if (len == 0)
-				/* Still reading the header. */
-				return TRUE;
-			if (len == -1) {
-				sr_err("Error while reading block header, aborting capture.");
-				std_session_send_df_frame_end(sdi);
-				sr_dev_acquisition_stop(sdi);
-				return TRUE;
-			}
-			/* At slow timebases in live capture the DS2072 and
-			 * DS1054Z sometimes return "short" data blocks, with
-			 * apparently no way to get the rest of the data.
-			 * Discard these, the complete data block will appear
-			 * eventually.
-			 */
-			if (devc->data_source == DATA_SOURCE_LIVE
-					&& (unsigned)len < expected_data_bytes) {
-				sr_dbg("Discarding short data block: got %d/%d bytes\n", len, (int)expected_data_bytes);
-				sr_scpi_read_data(scpi, (char *)devc->buffer, len + 1);
-				devc->num_header_bytes = 0;
-				return TRUE;
-			}
-			devc->num_block_bytes = len;
-		} else {
-			devc->num_block_bytes = expected_data_bytes;
+		if (len == -1) {
+			sr_err("Error while reading block header, aborting capture.");
+			std_session_send_df_frame_end(sdi);
+			sr_dev_acquisition_stop(sdi);
+			devc->state = STATE_IDLE;
+			return TRUE;
 		}
+
+		devc->num_block_bytes = len;
 		devc->num_block_read = 0;
 	}
 
@@ -731,6 +338,7 @@ SR_PRIV int keysight_receive(int fd, int revents, void *cb_data)
 		sr_err("Error while reading block data, aborting capture.");
 		std_session_send_df_frame_end(sdi);
 		sr_dev_acquisition_stop(sdi);
+		devc->state = STATE_IDLE;
 		return TRUE;
 	}
 
@@ -743,12 +351,8 @@ SR_PRIV int keysight_receive(int fd, int revents, void *cb_data)
 		vdiv = devc->vert_inc[ch->index];
 		origin = devc->vert_origin[ch->index];
 		offset = devc->vert_offset[ch->index];
-		if (devc->model->series->protocol >= PROTOCOL_V3)
-			for (i = 0; i < len; i++)
-				devc->data[i] = ((int)devc->buffer[i] - vref - origin) * vdiv;
-		else
-			for (i = 0; i < len; i++)
-				devc->data[i] = (128 - devc->buffer[i]) * vdiv - offset;
+		for (i = 0; i < len; i++)
+			devc->data[i] = ((int)devc->buffer[i] - vref - origin) * vdiv;
 		float vdivlog = log10f(vdiv);
 		int digits = -(int)vdivlog + (vdivlog < 0.0);
 		sr_analog_init(&analog, &encoding, &meaning, &spec, digits);
@@ -764,10 +368,7 @@ SR_PRIV int keysight_receive(int fd, int revents, void *cb_data)
 		g_slist_free(analog.meaning->channels);
 	} else {
 		logic.length = len;
-		// TODO: For the MSO1000Z series, we need a way to express that
-		// this data is in fact just for a single channel, with the valid
-		// data for that channel in the LSB of each byte.
-		logic.unitsize = devc->model->series->protocol >= PROTOCOL_V4 ? 1 : 2;
+		logic.unitsize = 1; // We get only 8 bits of logic data from either POD1 or POD2 but not both
 		logic.data = devc->buffer;
 		packet.type = SR_DF_LOGIC;
 		packet.payload = &logic;
@@ -776,21 +377,17 @@ SR_PRIV int keysight_receive(int fd, int revents, void *cb_data)
 
 	if (devc->num_block_read == devc->num_block_bytes) {
 		sr_dbg("Block has been completed");
-		if (devc->model->series->protocol >= PROTOCOL_V3) {
-			/* Discard the terminating linefeed */
-			sr_scpi_read_data(scpi, (char *)devc->buffer, 1);
-		}
-		if (devc->format == FORMAT_IEEE488_2) {
-			/* Prepare for possible next block */
-			devc->num_header_bytes = 0;
-			devc->num_block_bytes = 0;
-			if (devc->data_source != DATA_SOURCE_LIVE)
-				keysight_set_wait_event(devc, WAIT_BLOCK);
-		}
+		/* Discard the terminating linefeed */
+		sr_scpi_read_data(scpi, (char *)devc->buffer, 1);
+
+		/* Prepare for possible next block */
+		devc->num_header_bytes = 0;
+		devc->num_block_bytes = 0;
+		devc->num_block_read = 0;
+
 		if (!sr_scpi_read_complete(scpi) && !devc->channel_entry->next) {
 			sr_err("Read should have been completed");
 		}
-		devc->num_block_read = 0;
 	} else {
 		sr_dbg("%" PRIu64 " of %" PRIu64 " block bytes read",
 			devc->num_block_read, devc->num_block_bytes);
@@ -798,21 +395,12 @@ SR_PRIV int keysight_receive(int fd, int revents, void *cb_data)
 
 	devc->num_channel_bytes += len;
 
-	if (devc->num_channel_bytes < expected_data_bytes)
+	if (devc->num_channel_bytes < devc->num_channel_bytes_total) {
 		/* Don't have the full data for this channel yet, re-run. */
 		return TRUE;
+	}
 
 	/* End of data for this channel. */
-	if (devc->model->series->protocol == PROTOCOL_V3) {
-		/* Signal end of data download to scope */
-		if (devc->data_source != DATA_SOURCE_LIVE)
-			/*
-			 * This causes a query error, without it switching
-			 * to the next channel causes an error. Fun with
-			 * firmware...
-			 */
-			keysight_config_set(sdi, ":WAV:END");
-	}
 
 	if (devc->channel_entry->next) {
 		/* We got the frame for this channel, now get the next channel. */
@@ -821,36 +409,17 @@ SR_PRIV int keysight_receive(int fd, int revents, void *cb_data)
 	} else {
 		/* Done with this frame. */
 		std_session_send_df_frame_end(sdi);
+		devc->state = STATE_IDLE;
 
 		devc->num_frames++;
 
-		/* V5 has no way to read the number of recorded frames, so try to set the
-		 * next frame and read it back instead.
-		 */
-		if (devc->data_source == DATA_SOURCE_SEGMENTED &&
-				devc->model->series->protocol == PROTOCOL_V5) {
-			int frames = 0;
-			if (keysight_config_set(sdi, "REC:CURR %d", devc->num_frames + 1) != SR_OK)
-				return SR_ERR;
-			if (sr_scpi_get_int(sdi->conn, "REC:CURR?", &frames) != SR_OK)
-				return SR_ERR;
-			devc->num_frames_segmented = frames;
-		}
+		/* Get the next frame, starting with the first channel. */
+		devc->channel_entry = devc->enabled_channels;
 
-		if (devc->num_frames == devc->limit_frames ||
-				devc->num_frames == devc->num_frames_segmented ||
-				devc->data_source == DATA_SOURCE_MEMORY) {
-			/* Last frame, stop capture. */
-			sr_dev_acquisition_stop(sdi);
-		} else {
-			/* Get the next frame, starting with the first channel. */
-			devc->channel_entry = devc->enabled_channels;
+		keysight_capture_start(sdi);
 
-			keysight_capture_start(sdi);
-
-			/* Start of next frame. */
-			std_session_send_df_frame_begin(sdi);
-		}
+		/* Start of next frame. */
+		std_session_send_df_frame_begin(sdi);
 	}
 
 	return TRUE;
@@ -882,20 +451,8 @@ SR_PRIV int keysight_get_dev_cfg(const struct sr_dev_inst *sdi)
 
 	/* Digital channel state. */
 	if (devc->model->has_digital) {
-		if (sr_scpi_get_bool(sdi->conn,
-				devc->model->series->protocol >= PROTOCOL_V3 ?
-					":LA:STAT?" : ":LA:DISP?",
-				&devc->la_enabled) != SR_OK)
-			return SR_ERR;
-		sr_dbg("Logic analyzer %s, current digital channel state:",
-				devc->la_enabled ? "enabled" : "disabled");
 		for (i = 0; i < ARRAY_SIZE(devc->digital_channels); i++) {
-			if (devc->model->series->protocol >= PROTOCOL_V5)
-				cmd = g_strdup_printf(":LA:DISP? D%d", i);
-			else if (devc->model->series->protocol >= PROTOCOL_V3)
-				cmd = g_strdup_printf(":LA:DIG%d:DISP?", i);
-			else
-				cmd = g_strdup_printf(":DIG%d:TURN?", i);
+			cmd = g_strdup_printf(":DIG%d:DISP?", i);
 			res = sr_scpi_get_bool(sdi->conn, cmd, &devc->digital_channels[i]);
 			g_free(cmd);
 			if (res != SR_OK)
@@ -963,8 +520,7 @@ SR_PRIV int keysight_get_dev_cfg(const struct sr_dev_inst *sdi)
 	sr_dbg("Current trigger source %s", devc->trigger_source);
 
 	/* Horizontal trigger position. */
-	if (sr_scpi_get_float(sdi->conn, devc->model->cmds[CMD_GET_HORIZ_TRIGGERPOS].str,
-			&devc->horiz_triggerpos) != SR_OK)
+	if (sr_scpi_get_float(sdi->conn, ":TIM:POS?", &devc->horiz_triggerpos) != SR_OK)
 		return SR_ERR;
 	sr_dbg("Current horizontal trigger position %g", devc->horiz_triggerpos);
 
@@ -979,6 +535,11 @@ SR_PRIV int keysight_get_dev_cfg(const struct sr_dev_inst *sdi)
 	if (sr_scpi_get_float(sdi->conn, ":TRIG:EDGE:LEV?", &devc->trigger_level) != SR_OK)
 		return SR_ERR;
 	sr_dbg("Current trigger level %g", devc->trigger_level);
+
+	/* Sample rate. */
+	if (sr_scpi_get_float(sdi->conn, ":ACQ:SRAT?", &devc->sample_rate) != SR_OK)
+		return SR_ERR;
+	sr_dbg("Current sample rate %g", devc->sample_rate);
 
 	return SR_OK;
 }
